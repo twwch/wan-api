@@ -61,7 +61,7 @@ app = FastAPI(
 # Mount Gradio UI at /app
 from web_ui import mount_to_app
 
-mount_to_app(app)
+mount_to_app(app, queue, worker)
 
 
 def _validate_task(req: TaskCreate) -> None:

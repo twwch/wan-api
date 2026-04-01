@@ -1,18 +1,26 @@
 """
 Gradio UI for Wan2.2 Video Generation, mounted at /app.
+
+Directly interacts with the queue/worker instead of HTTP self-requests,
+avoiding 502 issues on Windows and reducing latency.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
-import json
-import time
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 import gradio as gr
-import httpx
 
-API_BASE = "http://127.0.0.1:8000"
+if TYPE_CHECKING:
+    from queue_manager import BaseQueue
+    from worker import Worker
+
+# Set by mount_to_app()
+_queue: BaseQueue | None = None
+_worker: Worker | None = None
 
 
 def _image_to_base64(img) -> str | None:
@@ -23,7 +31,7 @@ def _image_to_base64(img) -> str | None:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def submit_task(
+async def submit_task(
     task_type: str,
     prompt: str,
     reference_image,
@@ -35,120 +43,138 @@ def submit_task(
     guide_scale: float,
     seed: int,
 ):
-    payload = {
-        "task_type": task_type,
-        "prompt": prompt,
-        "size": size,
-        "frame_num": int(frame_num),
-        "sample_steps": int(sample_steps),
-        "guide_scale": float(guide_scale),
-        "seed": int(seed),
-    }
+    from schemas import TaskRecord
 
-    if task_type == "i2v":
-        if reference_image is None:
-            raise gr.Error("i2v 模式需要上传参考图")
-        payload["reference_image"] = _image_to_base64(reference_image)
-    elif task_type == "ti2v":
-        if first_frame is None:
-            raise gr.Error("ti2v 模式需要上传首帧图")
-        payload["first_frame"] = _image_to_base64(first_frame)
-        if last_frame is not None:
-            payload["last_frame"] = _image_to_base64(last_frame)
+    if task_type == "i2v" and reference_image is None:
+        raise gr.Error("i2v 模式需要上传参考图")
+    if task_type == "ti2v" and first_frame is None:
+        raise gr.Error("ti2v 模式需要上传首帧图")
 
-    resp = httpx.post(f"{API_BASE}/api/v1/tasks", json=payload, timeout=10)
-    if resp.status_code != 201:
-        raise gr.Error(f"提交失败: {resp.text}")
+    ref_img_b64 = _image_to_base64(reference_image) if task_type == "i2v" else None
+    first_b64 = _image_to_base64(first_frame) if task_type == "ti2v" else None
+    last_b64 = _image_to_base64(last_frame) if task_type == "ti2v" else None
 
-    data = resp.json()
-    task_id = data["task_id"]
+    task = TaskRecord(
+        task_type=task_type,
+        prompt=prompt,
+        reference_image=ref_img_b64,
+        first_frame=first_b64,
+        last_frame=last_b64,
+        size=size,
+        frame_num=int(frame_num),
+        sample_steps=int(sample_steps),
+        guide_scale=float(guide_scale),
+        seed=int(seed),
+    )
+
+    try:
+        await _queue.put(task)
+    except asyncio.QueueFull:
+        raise gr.Error("队列已满，请稍后再试")
+
+    position = await _queue.queue_position(task.task_id)
+    data = _task_to_dict(task, position)
     return (
-        f"任务已提交: {task_id}",
-        task_id,
+        f"任务已提交: {task.task_id}",
+        task.task_id,
         _format_status(data),
         gr.update(interactive=True),
         None,
     )
 
 
-def poll_status(task_id: str):
+async def poll_status(task_id: str):
     if not task_id:
         return "请先提交任务", gr.update(), None
 
-    resp = httpx.get(f"{API_BASE}/api/v1/tasks/{task_id}", timeout=10)
-    if resp.status_code != 200:
-        return f"查询失败: {resp.text}", gr.update(), None
+    task = await _queue.get_task(task_id)
+    if not task:
+        return "任务不存在", gr.update(), None
 
-    data = resp.json()
+    position = await _queue.queue_position(task_id)
+    data = _task_to_dict(task, position)
     status_text = _format_status(data)
 
     video = None
-    if data["status"] == "completed" and data.get("video_url"):
-        video_resp = httpx.get(f"{API_BASE}{data['video_url']}", timeout=60)
-        if video_resp.status_code == 200:
-            tmp_path = f"/tmp/wan_{task_id}.mp4"
-            with open(tmp_path, "wb") as f:
-                f.write(video_resp.content)
-            video = tmp_path
+    if task.status == "completed" and task.video_path:
+        video = task.video_path
 
     return status_text, gr.update(), video
 
 
-def auto_poll(task_id: str):
+async def auto_poll(task_id: str):
     """Poll until terminal state."""
     if not task_id:
         yield "请先提交任务", None
         return
 
     while True:
-        resp = httpx.get(f"{API_BASE}/api/v1/tasks/{task_id}", timeout=10)
-        if resp.status_code != 200:
-            yield f"查询失败: {resp.text}", None
+        task = await _queue.get_task(task_id)
+        if not task:
+            yield "任务不存在", None
             return
 
-        data = resp.json()
-        status = data["status"]
+        position = await _queue.queue_position(task_id)
+        data = _task_to_dict(task, position)
         status_text = _format_status(data)
 
-        if status == "completed" and data.get("video_url"):
-            video_resp = httpx.get(f"{API_BASE}{data['video_url']}", timeout=120)
-            if video_resp.status_code == 200:
-                tmp_path = f"/tmp/wan_{task_id}.mp4"
-                with open(tmp_path, "wb") as f:
-                    f.write(video_resp.content)
-                yield status_text, tmp_path
-                return
+        if task.status == "completed" and task.video_path:
+            yield status_text, task.video_path
+            return
 
-        if status in ("failed", "cancelled"):
+        if task.status in ("failed", "cancelled"):
             yield status_text, None
             return
 
         yield status_text, None
-        time.sleep(3)
+        await asyncio.sleep(3)
 
 
-def get_queue_status():
+async def get_queue_status():
     try:
-        resp = httpx.get(f"{API_BASE}/api/v1/queue/status", timeout=5)
-        data = resp.json()
+        all_tasks = list((await _queue.list_tasks(page=1, page_size=10000))[0])
+        from schemas import TaskStatus
+        completed = sum(1 for t in all_tasks if t.status == TaskStatus.COMPLETED)
+        failed = sum(1 for t in all_tasks if t.status == TaskStatus.FAILED)
+        pending = await _queue.pending_count()
+        current_id = _worker.current_task_id if _worker else None
         lines = [
-            f"排队任务: {data['pending_count']}",
-            f"当前任务: {data['current_task_id'] or '无'}",
-            f"已完成: {data['completed_count']}",
-            f"已失败: {data['failed_count']}",
+            f"排队任务: {pending}",
+            f"当前任务: {current_id or '无'}",
+            f"已完成: {completed}",
+            f"已失败: {failed}",
         ]
         return "\n".join(lines)
     except Exception as e:
         return f"获取失败: {e}"
 
 
-def cancel_task(task_id: str):
+async def cancel_task(task_id: str):
     if not task_id:
         return "无任务可取消"
-    resp = httpx.delete(f"{API_BASE}/api/v1/tasks/{task_id}", timeout=10)
-    if resp.status_code == 200:
+    task = await _queue.get_task(task_id)
+    if not task:
+        return "任务不存在"
+    if task.status != "pending":
+        return f"无法取消 {task.status} 状态的任务"
+    ok = await _queue.cancel(task_id)
+    if ok:
         return "任务已取消"
-    return f"取消失败: {resp.text}"
+    return "取消失败"
+
+
+def _task_to_dict(task, position=None) -> dict:
+    """Convert TaskRecord to a dict for display."""
+    return {
+        "task_id": task.task_id,
+        "task_type": task.task_type,
+        "status": task.status,
+        "prompt": task.prompt,
+        "progress": task.progress,
+        "error": task.error,
+        "video_path": task.video_path,
+        "queue_position": position,
+    }
 
 
 def _format_status(data: dict) -> str:
@@ -289,7 +315,10 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
-def mount_to_app(app):
+def mount_to_app(app, queue, worker):
     """Mount Gradio UI to FastAPI app at /app."""
+    global _queue, _worker
+    _queue = queue
+    _worker = worker
     demo = build_ui()
     return gr.mount_gradio_app(app, demo, path="/app")
