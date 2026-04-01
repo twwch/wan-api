@@ -24,7 +24,7 @@
 # 1. 安装 Wan2.2（参考官方文档）
 git clone https://github.com/Wan-Video/Wan2.2.git
 cd Wan2.2
-pip install -r requirements.txt
+pip install -e .          # 安装 wan 包（如果没有 setup.py，改用: pip install -r requirements.txt 然后设置 PYTHONPATH 指向此目录）
 
 # 2. 下载模型权重
 huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --local-dir ./Wan2.2-TI2V-5B

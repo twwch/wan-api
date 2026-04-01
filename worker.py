@@ -172,13 +172,21 @@ class Worker:
             img = _decode_image(task.first_frame)
         # t2v: img stays None
 
-        # Build generation kwargs
+        # Build generation kwargs matching WanTI2V.generate() signature:
+        #   generate(input_prompt, img=None, size=None, max_area=720*1280,
+        #            frame_num=81, shift=5.0, sample_solver='unipc',
+        #            sampling_steps=40, guide_scale=5.0, seed=-1,
+        #            offload_model=True)
+        w, h = size
+        max_area = w * h
+
         kwargs = dict(
-            prompt=task.prompt,
             img=img,
             size=size,
+            max_area=max_area,
             frame_num=frame_num,
             shift=shift,
+            sample_solver='unipc',
             sampling_steps=sample_steps,
             guide_scale=guide_scale,
             seed=seed,
@@ -190,7 +198,7 @@ class Worker:
             last_img = _decode_image(task.last_frame)
             kwargs["last_img"] = last_img
 
-        video = self._model.generate(**kwargs)
+        video = self._model.generate(task.prompt, **kwargs)
 
         # Save video
         output_path = str(Path(settings.output_dir) / f"{task.task_id}.mp4")
