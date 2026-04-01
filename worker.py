@@ -58,12 +58,22 @@ class Worker:
         self._model: Any = None
         self._config: Any = None
         self._running = False
+        self._ready = False
+        self._start_error: Optional[str] = None
         self._current_task_id: Optional[str] = None
         self._notify_callbacks: dict[str, list[Callable]] = {}
 
     @property
     def current_task_id(self) -> Optional[str]:
         return self._current_task_id
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    @property
+    def start_error(self) -> Optional[str]:
+        return self._start_error
 
     def register_callback(self, task_id: str, callback: Callable) -> None:
         self._notify_callbacks.setdefault(task_id, []).append(callback)
@@ -90,9 +100,15 @@ class Worker:
         """Main worker loop. Runs as an asyncio task."""
         self._running = True
         # Load model in thread pool
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.load_model)
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.load_model)
+        except Exception as e:
+            self._start_error = f"{type(e).__name__}: {e}"
+            logger.error(f"Worker failed to load model: {self._start_error}")
+            return
 
+        self._ready = True
         logger.info("Worker started, waiting for tasks...")
         while self._running:
             try:

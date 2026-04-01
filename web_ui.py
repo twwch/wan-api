@@ -12,11 +12,15 @@ import base64
 from io import BytesIO
 from typing import TYPE_CHECKING
 
+import logging
+
 import gradio as gr
 
 if TYPE_CHECKING:
     from queue_manager import BaseQueue
     from worker import Worker
+
+logger = logging.getLogger(__name__)
 
 # Set by mount_to_app()
 _queue: BaseQueue | None = None
@@ -45,6 +49,9 @@ async def submit_task(
 ):
     from schemas import TaskRecord
 
+    if _worker and _worker.start_error:
+        raise gr.Error(f"Worker 启动失败: {_worker.start_error}")
+
     if task_type == "i2v" and reference_image is None:
         raise gr.Error("i2v 模式需要上传参考图")
     if task_type == "ti2v" and first_frame is None:
@@ -72,6 +79,7 @@ async def submit_task(
     except asyncio.QueueFull:
         raise gr.Error("队列已满，请稍后再试")
 
+    logger.info(f"Task {task.task_id} created ({task.task_type})")
     position = await _queue.queue_position(task.task_id)
     data = _task_to_dict(task, position)
     return (
@@ -126,6 +134,12 @@ async def auto_poll(task_id: str):
             yield status_text, None
             return
 
+        if _worker and not _worker.ready and not _worker.start_error:
+            status_text += "\n\n⏳ 模型加载中，请等待..."
+        elif _worker and _worker.start_error:
+            status_text += f"\n\n❌ Worker 错误: {_worker.start_error}"
+            yield status_text, None
+            return
         yield status_text, None
         await asyncio.sleep(3)
 
