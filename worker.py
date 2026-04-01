@@ -28,8 +28,21 @@ def _decode_image(b64_str: str) -> Image.Image:
     return Image.open(BytesIO(data)).convert("RGB")
 
 
+def _patch_flash_attention():
+    """Replace flash_attention with attention (has SDPA fallback) for non-flash_attn environments."""
+    from wan.modules.attention import FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE
+    if not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE:
+        import wan.modules.attention as attn_mod
+        import wan.modules.model as model_mod
+        logger.info("flash_attn not available, patching to use PyTorch SDPA")
+        attn_mod.flash_attention = attn_mod.attention
+        model_mod.flash_attention = attn_mod.attention
+
+
 def _load_model():
     """Load Wan2.2 TI2V-5B model. Called once at startup."""
+    _patch_flash_attention()
+
     import wan
     from wan.configs import WAN_CONFIGS
 
