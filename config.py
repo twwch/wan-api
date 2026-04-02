@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Model
-    model_checkpoint_dir: str = "./Wan2.2-TI2V-5B"
+    model_checkpoint_dir: str = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     device_id: int = 0
     offload_model: bool = True
 

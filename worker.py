@@ -1,5 +1,6 @@
 """
-GPU worker that consumes tasks from the queue and runs Wan2.2 inference.
+GPU worker that consumes tasks from the queue and runs Wan2.2 inference
+using HuggingFace Diffusers pipeline.
 """
 
 from __future__ import annotations
@@ -21,40 +22,7 @@ from schemas import TaskRecord, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
 
-
-def _decode_image(b64_str: str) -> Image.Image:
-    """Decode base64 string to PIL Image."""
-    data = base64.b64decode(b64_str)
-    return Image.open(BytesIO(data)).convert("RGB")
-
-
-def _patch_flash_attention():
-    """Replace flash_attention with attention (has SDPA fallback) for non-flash_attn environments."""
-    from wan.modules.attention import FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE
-    if not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE:
-        import wan.modules.attention as attn_mod
-        import wan.modules.model as model_mod
-        logger.info("flash_attn not available, patching to use PyTorch SDPA")
-        attn_mod.flash_attention = attn_mod.attention
-        model_mod.flash_attention = attn_mod.attention
-
-
-def _load_model():
-    """Load Wan2.2 TI2V-5B model. Called once at startup."""
-    _patch_flash_attention()
-
-    import wan
-    from wan.configs import WAN_CONFIGS
-
-    cfg = WAN_CONFIGS["ti2v-5B"]
-    model = wan.WanTI2V(
-        config=cfg,
-        checkpoint_dir=settings.model_checkpoint_dir,
-        device_id=settings.device_id,
-        rank=0,
-    )
-    return model, cfg
-
+SAMPLE_FPS = 24
 
 SIZE_MAP = {
     "1280*704": (1280, 704),
@@ -66,10 +34,51 @@ SIZE_MAP = {
 }
 
 
+def _decode_image(b64_str: str) -> Image.Image:
+    """Decode base64 string to PIL Image."""
+    data = base64.b64decode(b64_str)
+    return Image.open(BytesIO(data)).convert("RGB")
+
+
+def _load_pipeline():
+    """Load Wan2.2 TI2V-5B Diffusers pipeline."""
+    import torch
+    from diffusers import AutoencoderKLWan, WanImageToVideoPipeline, WanPipeline
+
+    model_id = settings.model_checkpoint_dir
+    dtype = torch.float16
+
+    logger.info(f"Loading VAE from {model_id} ...")
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float32
+    )
+
+    # T2V pipeline (text-only)
+    logger.info(f"Loading T2V pipeline from {model_id} ...")
+    t2v_pipe = WanPipeline.from_pretrained(
+        model_id, vae=vae, torch_dtype=dtype
+    )
+
+    # I2V pipeline (image+text) — shares components with t2v
+    logger.info(f"Loading I2V pipeline from {model_id} ...")
+    i2v_pipe = WanImageToVideoPipeline.from_pretrained(
+        model_id, vae=vae, torch_dtype=dtype
+    )
+
+    if settings.offload_model:
+        t2v_pipe.enable_model_cpu_offload()
+        i2v_pipe.enable_model_cpu_offload()
+    else:
+        t2v_pipe.to(f"cuda:{settings.device_id}")
+        i2v_pipe.to(f"cuda:{settings.device_id}")
+
+    return t2v_pipe, i2v_pipe
+
+
 class Worker:
     def __init__(self) -> None:
-        self._model: Any = None
-        self._config: Any = None
+        self._t2v_pipe: Any = None
+        self._i2v_pipe: Any = None
         self._running = False
         self._ready = False
         self._start_error: Optional[str] = None
@@ -105,14 +114,13 @@ class Worker:
 
     def load_model(self) -> None:
         """Load model in a thread to not block the event loop."""
-        logger.info("Loading Wan2.2 TI2V-5B model...")
-        self._model, self._config = _load_model()
-        logger.info("Model loaded successfully.")
+        logger.info("Loading Wan2.2 TI2V-5B Diffusers pipeline...")
+        self._t2v_pipe, self._i2v_pipe = _load_pipeline()
+        logger.info("Pipeline loaded successfully.")
 
     async def start(self, queue) -> None:
         """Main worker loop. Runs as an asyncio task."""
         self._running = True
-        # Load model in thread pool
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.load_model)
@@ -161,21 +169,23 @@ class Worker:
             await self._notify(task)
 
     async def _generate(self, task: TaskRecord) -> str:
-        """Run Wan2.2 generation in thread pool."""
+        """Run generation in thread pool."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._generate_sync, task)
 
     def _generate_sync(self, task: TaskRecord) -> str:
-        """Synchronous generation on GPU."""
-        from wan.utils.utils import save_video
+        """Synchronous generation on GPU using Diffusers pipeline."""
+        import torch
+        from diffusers.utils import export_to_video
 
         size_str = task.size or settings.default_size
-        size = SIZE_MAP.get(size_str, (1280, 704))
-        frame_num = task.frame_num or settings.default_frame_num
-        sample_steps = task.sample_steps or settings.default_sample_steps
-        shift = task.sample_shift or settings.default_sample_shift
+        w, h = SIZE_MAP.get(size_str, (1280, 704))
+        num_frames = task.frame_num or settings.default_frame_num
+        num_steps = task.sample_steps or settings.default_sample_steps
         guide_scale = task.guide_scale or settings.default_guide_scale
         seed = task.seed if (task.seed is not None and task.seed >= 0) else random.randint(0, 2**32 - 1)
+
+        generator = torch.Generator(device="cpu").manual_seed(seed)
 
         # Determine image input
         img = None
@@ -183,44 +193,34 @@ class Worker:
             img = _decode_image(task.reference_image)
         elif task.task_type == TaskType.TI2V and task.first_frame:
             img = _decode_image(task.first_frame)
-        # t2v: img stays None
 
-        # Build generation kwargs matching WanTI2V.generate() signature:
-        #   generate(input_prompt, img=None, size=None, max_area=720*1280,
-        #            frame_num=81, shift=5.0, sample_solver='unipc',
-        #            sampling_steps=40, guide_scale=5.0, seed=-1,
-        #            offload_model=True)
-        w, h = size
-        max_area = w * h
-
-        kwargs = dict(
-            img=img,
-            size=size,
-            max_area=max_area,
-            frame_num=frame_num,
-            shift=shift,
-            sample_solver='unipc',
-            sampling_steps=sample_steps,
-            guide_scale=guide_scale,
-            seed=seed,
-            offload_model=settings.offload_model,
-        )
-
-        # Last frame support (if model accepts it)
-        if task.last_frame:
-            last_img = _decode_image(task.last_frame)
-            kwargs["last_img"] = last_img
-
-        video = self._model.generate(task.prompt, **kwargs)
+        # Choose pipeline based on whether we have an image
+        if img is not None:
+            # Image-to-video pipeline
+            output = self._i2v_pipe(
+                prompt=task.prompt,
+                image=img,
+                height=h,
+                width=w,
+                num_frames=num_frames,
+                num_inference_steps=num_steps,
+                guidance_scale=guide_scale,
+                generator=generator,
+            )
+        else:
+            # Text-to-video pipeline
+            output = self._t2v_pipe(
+                prompt=task.prompt,
+                height=h,
+                width=w,
+                num_frames=num_frames,
+                num_inference_steps=num_steps,
+                guidance_scale=guide_scale,
+                generator=generator,
+            )
 
         # Save video
+        frames = output.frames[0]
         output_path = str(Path(settings.output_dir) / f"{task.task_id}.mp4")
-        save_video(
-            video[None],
-            output_path,
-            fps=self._config.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1),
-        )
+        export_to_video(frames, output_path, fps=SAMPLE_FPS)
         return output_path
