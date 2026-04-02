@@ -65,6 +65,10 @@ def _load_pipeline():
         model_id, vae=vae, torch_dtype=dtype
     )
 
+    # Enable VAE tiling to avoid OOM during decode
+    t2v_pipe.vae.enable_tiling()
+    i2v_pipe.vae.enable_tiling()
+
     if settings.offload_model:
         t2v_pipe.enable_model_cpu_offload()
         i2v_pipe.enable_model_cpu_offload()
